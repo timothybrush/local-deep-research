@@ -68,7 +68,7 @@ from ...utilities.url_utils import normalize_url
 from ...security.decorators import require_json_body
 from ...security.egress.policy import DEFAULT_EGRESS_SCOPE
 from ...security.egress.validators import (
-    validate_allowed_local_hostnames,
+    first_egress_validation_error,
 )
 from ..auth.decorators import login_required
 from ..utils.request_helpers import parse_bool_arg
@@ -82,6 +82,7 @@ from ..services.settings_service import (
     create_or_update_setting,
     invalidate_settings_caches,
     reschedule_document_jobs_if_needed,
+    reschedule_zotero_jobs_if_needed,
     set_setting,
 )
 from ..utils.route_decorators import with_user_session
@@ -171,6 +172,7 @@ ALLOWED_SETTING_PREFIXES = frozenset(
         "search.",
         "ui.",
         "web.",
+        "zotero.",
     }
 )
 BLOCKED_SETTING_PREFIXES = frozenset(
@@ -422,12 +424,11 @@ def save_all_settings(
         # Fetch all settings and remove non-editable keys
         all_db_settings = _filter_editable_settings(form_data, db_session)
 
-        # Reject public hostnames being added to the local-hosts allowlist.
-        _hosts_err = validate_allowed_local_hostnames(
-            form_data, all_db_settings
-        )
-        if _hosts_err is not None:
-            validation_errors.append(_hosts_err)
+        # Reject public hostnames being added to the local-hosts allowlist, and
+        # inherently-public engines being added to the trusted-engines list.
+        _egress_err = first_egress_validation_error(form_data, all_db_settings)
+        if _egress_err is not None:
+            validation_errors.append(_egress_err)
             return (
                 jsonify(
                     {
@@ -754,6 +755,9 @@ def save_all_settings(
         reschedule_document_jobs_if_needed(
             session["username"], updated_settings + created_settings
         )
+        reschedule_zotero_jobs_if_needed(
+            session["username"], updated_settings + created_settings
+        )
         return jsonify(response_data)
 
     except Exception:
@@ -826,13 +830,10 @@ def save_settings(db_session: Optional[Session] = None, settings_manager=None):
         # these; the POST fallback must too, or a JS-disabled client could
         # whitelist a public hostname as "local", which the JSON route does
         # not permit.
-        for _policy_validator in (validate_allowed_local_hostnames,):
-            _policy_err = _policy_validator(form_data, all_db_settings)
-            if _policy_err is not None:
-                flash(
-                    _policy_err.get("error", "Invalid policy setting"), "error"
-                )
-                return redirect(url_for("settings.settings_page"))
+        _policy_err = first_egress_validation_error(form_data, all_db_settings)
+        if _policy_err is not None:
+            flash(_policy_err.get("error", "Invalid policy setting"), "error")
+            return redirect(url_for("settings.settings_page"))
 
         # Process each setting
         for key, value in form_data.items():
@@ -1136,21 +1137,21 @@ def api_update_setting(key, db_session: Optional[Session] = None):
                 "policy.egress_scope",
                 "search.tool",
                 "llm.allowed_local_hostnames",
+                "policy.trusted_search_engines",
             ):
                 _all_db_settings = {
                     s.key: s for s in db_session.query(Setting).all()
                 }
-                _form = {key: value}
-                for _validator in (validate_allowed_local_hostnames,):
-                    _err = _validator(_form, _all_db_settings)
-                    if _err is not None:
-                        logger.bind(policy_audit=True).warning(
-                            "egress-policy setting rejected at "
-                            "api_update_setting",
-                            key=key,
-                            reason=_err.get("error"),
-                        )
-                        return jsonify({"error": _err["error"]}), 400
+                _err = first_egress_validation_error(
+                    {key: value}, _all_db_settings
+                )
+                if _err is not None:
+                    logger.bind(policy_audit=True).warning(
+                        "egress-policy setting rejected at api_update_setting",
+                        key=key,
+                        reason=_err.get("error"),
+                    )
+                    return jsonify({"error": _err["error"]}), 400
 
             # Update setting
             # Pass the db_session to avoid session lookup issues
@@ -1174,6 +1175,7 @@ def api_update_setting(key, db_session: Optional[Session] = None):
                 # A document_scheduler.* toggle (e.g. sweep_library_collections
                 # or generate_rag) must take effect without a re-login.
                 reschedule_document_jobs_if_needed(session["username"], [key])
+                reschedule_zotero_jobs_if_needed(session["username"], [key])
                 return jsonify(response_data)
             return jsonify({"error": f"Failed to update setting {key}"}), 500
 
@@ -1218,6 +1220,7 @@ def api_update_setting(key, db_session: Optional[Session] = None):
         if db_setting:
             invalidate_settings_caches(session["username"])
             reschedule_document_jobs_if_needed(session["username"], [key])
+            reschedule_zotero_jobs_if_needed(session["username"], [key])
             return (
                 jsonify(
                     {
